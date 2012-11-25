@@ -9,10 +9,26 @@
 //
 //============================================================================
 
+#include <linux/init.h>
+#include <linux/err.h>
+#include <linux/platform_device.h>
+#include <linux/jiffies.h>
+#include <linux/slab.h>
+#include <linux/time.h>
+#include <linux/wait.h>
+#include <linux/hrtimer.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/platform_device.h>
 
 #include <sound/core.h>
+#include <sound/control.h>
+#include <sound/tlv.h>
+#include <sound/pcm.h>
+#include <sound/rawmidi.h>
+#include <sound/info.h>
+#include <sound/initval.h>
 
 //============================================================================
 
@@ -44,6 +60,11 @@ MODULE_SUPPORTED_DEVICE("{{ALSA,Virtual Network Soundcard}}");
 
 //============================================================================
 
+static int __devinit snd_vans_probe(struct platform_device *devptr);
+static int __devexit snd_vans_remove(struct platform_device *devptr);
+static int snd_vans_suspend(struct platform_device *pdev, pm_message_t state);
+static int snd_vans_resume(struct platform_device *pdev);
+
 static struct platform_driver snd_vans_driver = {
 	.probe		= snd_vans_probe,
 	.remove		= __devexit_p(snd_vans_remove),
@@ -66,7 +87,7 @@ static struct snd_pcm_hardware vans_pcm_hardware = {
 	.rate_min =         USE_RATE_MIN,
 	.rate_max =         USE_RATE_MAX,
 	.channels_min =     USE_CHANNELS_MIN,
-	.chaneels_max =     USE_CHANNELS_MAX,
+	.channels_max =     USE_CHANNELS_MAX,
 	.buffer_bytes_max = MAX_BUFFER_SIZE,
 	.period_bytes_min = MIN_PERIOD_SIZE,
 	.period_bytes_max = MAX_PERIOD_SIZE,
@@ -83,17 +104,17 @@ struct snd_vans {
 
 };
 
-module_param(spk_socket_info, charp, S_IRUSER|S_IWUSR|S_IRGRP|S_IWGRP);
-MODULE_PARM_DESC(spk_socket_info, "network speaker socket info (ip:port)")
-module_param(mic_socket_info, charp, S_IRUSER|S_IWUSR|S_IRGRP|S_IWGRP);
-MODULE_PARM_DESC(mic_socket_info, "network microphone socket info (ip:port)")
+static char *spk_socket_info = "224.1.1.27:3456";
+static char *mic_socket_info = "224.1.1.27:3458";
+
+static struct platform_device *vans_device;
 
 //============================================================================
 
 static int __init vans_init(void)
 {
 	int i = 0;
-	struct platform_device *vans_device;
+	int err;
 	
 	// Create and register platform device.
 	err = platform_driver_register(&snd_vans_driver);
@@ -132,7 +153,7 @@ static void __exit vans_exit(void)
 
 //============================================================================
 
-static int __devinit vans_probe(struct platform_device *devptr)
+static int __devinit snd_vans_probe(struct platform_device *devptr)
 {
 	struct snd_card *card;
 	struct snd_vans *vans;
@@ -177,6 +198,33 @@ __nodev:
 	snd_card_free(card);
 	return err;
 } 
+
+static int __devexit snd_vans_remove(struct platform_device *devptr)
+{
+        snd_card_free(platform_get_drvdata(devptr));
+        platform_set_drvdata(devptr, NULL);
+        return 0;
+}
+
+#ifdef CONFIG_PM
+static int snd_vans_suspend(struct platform_device *pdev, pm_message_t state)
+{
+        struct snd_card *card = platform_get_drvdata(pdev);
+        struct snd_vans *vans = card->private_data;
+
+        snd_power_change_state(card, SNDRV_CTL_POWER_D3hot);
+        snd_pcm_suspend_all(vans->pcm);
+        return 0;
+}
+
+static int snd_vans_resume(struct platform_device *pdev)
+{
+        struct snd_card *card = platform_get_drvdata(pdev);
+
+        snd_power_change_state(card, SNDRV_CTL_POWER_D0);
+        return 0;
+}
+#endif
 
 static int __devinit snd_card_vans_pcm(struct snd_vans *vans, int device,
 				       int substreams)
