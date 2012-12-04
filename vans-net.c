@@ -13,6 +13,3 @@ static void __exit net_sound_exit(void)
 	return;
 	
 }
-
-module_init(net_sound_init)
-module_exit(net_sound_exit)

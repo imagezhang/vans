@@ -37,6 +37,9 @@ MODULE_DESCRIPTION("Virutal Alsa Network Soundcard");
 MODULE_LICENSE("GPL");
 MODULE_SUPPORTED_DEVICE("{{ALSA,Virtual Network Soundcard}}");
 
+module_param(debug_mode, int, 0444);
+MODULE_PARM_DESC(debug_mode, "Fake buffer allocations.");
+
 //============================================================================
 
 #define SND_VANS_DRIVER "snd_vans"
@@ -58,6 +61,9 @@ MODULE_SUPPORTED_DEVICE("{{ALSA,Virtual Network Soundcard}}");
 #define USE_PERIODS_MIN         1
 #define USE_PERIODS_MAX         1024
 
+#define DBG_VANS_ALSA 0x00000001
+#define DBG_VANS_NET  0x00000002
+
 //============================================================================
 
 static int __devinit snd_vans_probe(struct platform_device *devptr);
@@ -78,22 +84,31 @@ static struct platform_driver snd_vans_driver = {
 };
 
 static struct snd_pcm_hardware vans_pcm_hardware = {
-	.info =             (SNDRV_PCM_INFO_MMAP |
-			     SNDRV_PCM_INFO_INTERLEAVED |
-			     SNDRV_PCM_INFO_RESUME |
-			     SNDRV_PCM_INFO_MMAP_VALID),
-	.formats =          USE_FORMATS,
-	.rates =            USE_RATE,
-	.rate_min =         USE_RATE_MIN,
-	.rate_max =         USE_RATE_MAX,
-	.channels_min =     USE_CHANNELS_MIN,
-	.channels_max =     USE_CHANNELS_MAX,
-	.buffer_bytes_max = MAX_BUFFER_SIZE,
-	.period_bytes_min = MIN_PERIOD_SIZE,
-	.period_bytes_max = MAX_PERIOD_SIZE,
-	.periods_min =      USE_PERIODS_MIN,
-	.periods_max =      USE_PERIODS_MAX,
-	.fifo_size =        0,
+	.info =                 (SNDRV_PCM_INFO_MMAP |
+                                 SNDRV_PCM_INFO_INTERLEAVED |
+                                 SNDRV_PCM_INFO_RESUME |
+				 SNDRV_PCM_INFO_MMAP_VALID),
+	.formats =              USE_FORMATS,
+	.rates =                USE_RATE,
+	.rate_min =             USE_RATE_MIN,
+	.rate_max =             USE_RATE_MAX,
+	.channels_min =         USE_CHANNELS_MIN,
+	.channels_max =         USE_CHANNELS_MAX,
+	.buffer_bytes_max =     MAX_BUFFER_SIZE,
+	.period_bytes_min =     64,
+	.period_bytes_max =     MAX_PERIOD_SIZE,
+	.periods_min =          USE_PERIODS_MIN,
+	.periods_max =          USE_PERIODS_MAX,
+	.fifo_size =            0,
+};
+
+struct vans_timer_ops {
+	int (*create)(struct snd_pcm_substream *);
+	void (*free)(struct snd_pcm_substream *);
+	int (*prepare)(struct snd_pcm_substream *);
+	int (*start)(struct snd_pcm_substream *);
+	int (*stop)(struct snd_pcm_substream *);
+	snd_pcm_uframes_t (*pointer)(struct snd_pcm_substream *);
 };
 
 struct snd_vans {
@@ -101,13 +116,68 @@ struct snd_vans {
 	struct snd_pcm *pcm;
 
 	struct snd_pcm_hardware pcm_hw;
+	struct vans_timer_ops *timer_ops;
+};
 
+struct vans_hrtimer_pcm {
+	ktime_t base_time;
+	ktime_t period_time;
+	atomic_t running;
+	struct hrtimer timer;
+	struct tasklet_struct tasklet;
+	struct snd_pcm_substream *substream;
 };
 
 static char *spk_socket_info = "224.1.1.27:3456";
 static char *mic_socket_info = "224.1.1.27:3458";
 
 static struct platform_device *vans_device;
+
+//============================================================================
+
+static int __devinit snd_card_vans_pcm(struct snd_vans *vans, int device,
+				       int substreams);
+
+static int vans_pcm_open(struct snd_pcm_substream *substream);
+static int vans_pcm_close(struct snd_pcm_substream *substream);
+static int vans_pcm_trigger(struct snd_pcm_substream *substream, int cmd);
+static int vans_pcm_prepare(struct snd_pcm_substream *substream);
+static snd_pcm_uframes_t vans_pcm_pointer(struct snd_pcm_substream *substream);
+static int vans_pcm_hw_params(struct snd_pcm_substream *substream,
+			      struct snd_pcm_hw_params *hw_params);
+static int vans_pcm_hw_free(struct snd_pcm_substream *substream);
+
+static struct snd_pcm_ops vans_pcm_ops = {
+	.open      = vans_pcm_open,
+	.close     = vans_pcm_close,
+	.ioctl     = snd_pcm_lib_ioctl,
+	.hw_params = vans_pcm_hw_params,
+	.hw_free   = vans_pcm_hw_free,
+	.prepare   = vans_pcm_prepare,
+	.trigger   = vans_pcm_trigger,
+	.pointer   = vans_pcm_pointer
+};
+
+static snd_pcm_uframes_t vans_hrtimer_pointer(
+	struct snd_pcm_substream *sbustream);
+static int vans_hrtimer_prepare(struct snd_pcm_substream *substream);
+static int vans_hrtimer_create(struct snd_pcm_substream *substream);
+static void vans_hrtimer_free(struct snd_pcm_substream *substream);
+static enum hrtimer_restart vans_hrtimer_callback(struct hrtimer *timer);
+static void vans_hrtimer_pcm_elapsed(unsigned long priv);
+static int vans_hrtimer_start(struct snd_pcm_substream *substream);
+static int vans_hrtimer_stop(struct snd_pcm_substream *substream);
+static inline void vans_hrtimer_sync(struct vans_hrtimer_pcm *dpcm);
+
+
+static struct vans_timer_ops vans_hrtimer_ops = {
+	.create = vans_hrtimer_create,
+	.free = vans_hrtimer_free,
+	.prepare = vans_hrtimer_prepare,
+	.start = vans_hrtimer_start,
+	.stop = vans_hrtimer_stop,
+	.pointer = vans_hrtimer_pointer
+};
 
 //============================================================================
 
@@ -157,9 +227,10 @@ static int __devinit snd_vans_probe(struct platform_device *devptr)
 {
 	struct snd_card *card;
 	struct snd_vans *vans;
+	int err;
 
-	int dev_id = devptr->id;
-
+/*	int dev_id = devptr->id;
+ */
 	err = snd_card_create(IDX_AUTO_ALLOCATE, SND_VANS_CARD_ID,
 			      THIS_MODULE, sizeof(struct snd_vans), &card);
 	if (err < 0) {
@@ -184,17 +255,20 @@ static int __devinit snd_vans_probe(struct platform_device *devptr)
 	strcpy(card->shortname, "vans");
 	sprintf(card->longname, "vans");
 	
-	vans_proc_init(vans);
-	
+/*	vans_proc_init(vans);
+ */	
 	snd_card_set_dev(card, &devptr->dev);
 	
 	err = snd_card_register(card);
 	if (err == 0) {
 		platform_set_drvdata(devptr, card);
+		printk(KERN_INFO "%s: snd card registered succefully.\n",
+		       __FUNCTION__);
 		return 0;
 	}
 
 __nodev:
+	printk(KERN_INFO "%s: failed create device.\n", __FUNCTION__);
 	snd_card_free(card);
 	return err;
 } 
@@ -258,36 +332,6 @@ static int __devinit snd_card_vans_pcm(struct snd_vans *vans, int device,
 
 //============================================================================
 
-static struct snd_pcm_ops vans_pcm_ops = {
-	.open      = vans_pcm_open,
-	.close     = vans_pcm_close,
-	.ioctl     = snd_pcm_lib_ioctl,
-	.hw_params = vans_pcm_hw_params,
-	.hw_free   = vans_pcm_hw_free,
-	.prepare   = vans_pcm_prepare,
-	.trigger   = vans_pcm_trigger,
-	.pointer   = vans_pcm_pointer,
-};
-
-static struct snd_pcm_hardware vans_pcm_hardware = {
-	.info =                 (SNDRV_PCM_INFO_MMAP |
-                                 SNDRV_PCM_INFO_INTERLEAVED |
-                                 SNDRV_PCM_INFO_RESUME |
-					 SNDRV_PCM_INFO_MMAP_VALID),
-	.formats =              USE_FORMATS,
-	.rates =                USE_RATE,
-	.rate_min =             USE_RATE_MIN,
-	.rate_max =             USE_RATE_MAX,
-	.channels_min =         USE_CHANNELS_MIN,
-	.channels_max =         USE_CHANNELS_MAX,
-	.buffer_bytes_max =     MAX_BUFFER_SIZE,
-	.period_bytes_min =     64,
-	.period_bytes_max =     MAX_PERIOD_SIZE,
-	.periods_min =          USE_PERIODS_MIN,
-	.periods_max =          USE_PERIODS_MAX,
-	.fifo_size =            0,
-};
-
 static int vans_pcm_open(struct snd_pcm_substream *substream)
 {
 	struct snd_vans *vans = snd_pcm_substream_chip(substream);
@@ -305,6 +349,13 @@ static int vans_pcm_open(struct snd_pcm_substream *substream)
 	runtime->hw.info &= ~SNDRV_PCM_INFO_INTERLEAVED;
 	runtime->hw.info |= SNDRV_PCM_INFO_NONINTERLEAVED;
 	
+	return 0;
+}
+
+static int vans_pcm_close(struct snd_pcm_substream *substream)
+{
+	struct snd_vans *vans = snd_pcm_substream_chip(substream);
+	vans->timer_ops->free(substream);
 	return 0;
 }
 
@@ -331,7 +382,7 @@ static int vans_pcm_prepare(struct snd_pcm_substream *substream)
 	return vans->timer_ops->prepare(substream);
 }
 
-static int vans_pcm_pointer(struct snd_pcm_substream *substream)
+static snd_pcm_uframes_t vans_pcm_pointer(struct snd_pcm_substream *substream)
 {
 	struct snd_vans *vans = snd_pcm_substream_chip(substream);
 	
@@ -351,32 +402,15 @@ static int vans_pcm_hw_free(struct snd_pcm_substream *substream)
 }
 
 //============================================================================
-static struct vans_timer_ops vans_hrtimer_ops = {
-	.create = vans_hrtimer_create,
-	.free = vans_hrtimer_free,
-	.prepare = vans_hrtimer_prepare,
-	.start = vans_hrtimer_start,
-	.stop = vans_hrtimer_stop,
-	.pointer = vans_hrtimer_pointer
-};
-
-struct vans_hrtimer_pcm {
-	ktime_t base_time;
-	ktime_t period_time;
-	atomic_t running;
-	struct hrtimer timer;
-	struct tasklet_struct tasklet;
-	struct snd_pcm_substream *substream;
-}
 
 static snd_pcm_uframes_t vans_hrtimer_pointer(
-	struct snd_pcm_substream *sbustream)
+	struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
-	struct van_hrtimer_pcm *dpcm = runtime->private_data;
+	struct vans_hrtimer_pcm *dpcm = runtime->private_data;
 	u64 delta;
 	u32 pos;
-
+	
 	delta = ktime_us_delta(hrtimer_cb_get_time(&dpcm->timer),
 			       dpcm->base_time);
 	delta = div_u64(delta * runtime->rate + 999999, 1000000);
@@ -398,7 +432,7 @@ static int vans_hrtimer_prepare(struct snd_pcm_substream *substream)
 	rate = runtime->rate;
 	sec = period/rate;
 	
-	peroid %= rate;
+	period %= rate;
 	nsecs = div_u64((u64)period * 1000000000UL + rate - 1, rate);
 	dpcm->period_time = ktime_set(sec, nsecs);
 
@@ -413,7 +447,7 @@ static int vans_hrtimer_create(struct snd_pcm_substream *substream)
 		return -ENOMEM;
 	}
 
-	substream->runtime->private_date = dpcm;
+	substream->runtime->private_data = dpcm;
 	hrtimer_init(&dpcm->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	dpcm->timer.function = vans_hrtimer_callback;
 	dpcm->substream = substream;
@@ -423,12 +457,19 @@ static int vans_hrtimer_create(struct snd_pcm_substream *substream)
 	return 0;
 }
 
+static void vans_hrtimer_free(struct snd_pcm_substream *substream)
+{
+	struct vans_hrtimer_pcm *dpcm = substream->runtime->private_data;
+	vans_hrtimer_sync(dpcm);
+	kfree(dpcm);
+}
+
 static enum hrtimer_restart vans_hrtimer_callback(struct hrtimer *timer)
 {
 	struct vans_hrtimer_pcm *dpcm;
 	
-	dpcm = container_of(timer, struct dummy_hrtimer_pcm, timer);
-	if (!atomic_read(&dpcm_running)) {
+	dpcm = container_of(timer, struct vans_hrtimer_pcm, timer);
+	if (!atomic_read(&dpcm->running)) {
 		return HRTIMER_NORESTART;
 	}
 	
@@ -442,7 +483,7 @@ static void vans_hrtimer_pcm_elapsed(unsigned long priv)
 	struct vans_hrtimer_pcm *dpcm;
 	dpcm = (struct vans_hrtimer_pcm *)priv;
 
-	if (atomic_read(dpcm->running)) {
+	if (atomic_read(&dpcm->running)) {
 		snd_pcm_period_elapsed(dpcm->substream);
 	}
 	
@@ -451,7 +492,7 @@ static void vans_hrtimer_pcm_elapsed(unsigned long priv)
 
 static int vans_hrtimer_start(struct snd_pcm_substream *substream)
 {
-	struct vans_hrtimer_pcm *pcm = substream->runtime->private_data;
+	struct vans_hrtimer_pcm *dpcm = substream->runtime->private_data;
 
 	dpcm->base_time = hrtimer_cb_get_time(&dpcm->timer);
 	hrtimer_start(&dpcm->timer, dpcm->period_time, HRTIMER_MODE_REL);
@@ -462,7 +503,7 @@ static int vans_hrtimer_start(struct snd_pcm_substream *substream)
 
 static int vans_hrtimer_stop(struct snd_pcm_substream *substream)
 {
-	struct vans_hrtimer_pcm *pcm = substream->runtime->private_data;
+	struct vans_hrtimer_pcm *dpcm = substream->runtime->private_data;
 	
 	atomic_set(&dpcm->running, 0);
 	hrtimer_cancel(&dpcm->timer);
