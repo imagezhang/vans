@@ -30,6 +30,7 @@
 #include <sound/info.h>
 #include <sound/initval.h>
 
+#include "vans.h"
 //============================================================================
 
 MODULE_AUTHOR("J. Zhang <imagezhang.tech@gmail.com>");
@@ -37,8 +38,15 @@ MODULE_DESCRIPTION("Virutal Alsa Network Soundcard");
 MODULE_LICENSE("GPL");
 MODULE_SUPPORTED_DEVICE("{{ALSA,Virtual Network Soundcard}}");
 
+unsigned int debug_mode = 0;
+
 module_param(debug_mode, int, 0444);
 MODULE_PARM_DESC(debug_mode, "Fake buffer allocations.");
+
+//============================================================================
+
+int vans_net_init(void);
+int vans_net_sendto(void * buff, size_t len);
 
 //============================================================================
 
@@ -60,9 +68,6 @@ MODULE_PARM_DESC(debug_mode, "Fake buffer allocations.");
 #define USE_CHANNELS_MAX        1
 #define USE_PERIODS_MIN         1
 #define USE_PERIODS_MAX         1024
-
-#define DBG_VANS_ALSA 0x00000001
-#define DBG_VANS_NET  0x00000002
 
 //============================================================================
 
@@ -126,6 +131,8 @@ struct vans_hrtimer_pcm {
 	struct hrtimer timer;
 	struct tasklet_struct tasklet;
 	struct snd_pcm_substream *substream;
+
+	snd_pcm_uframes_t hw_ptr;
 };
 
 static char *spk_socket_info = "224.1.1.27:3456";
@@ -202,6 +209,9 @@ static int __init vans_init(void)
 		platform_device_unregister(vans_device);
 		return -ENODEV;
 	}
+
+	// Prepare the network interface.
+	vans_net_init();
 	
 	// Device created.
 	return 0;
@@ -338,6 +348,8 @@ static int vans_pcm_open(struct snd_pcm_substream *substream)
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	int err;
 	
+	DBG_VANS(DBG_VANS_ALSA, KERN_INFO, "entered\n");
+
 	vans->timer_ops = &vans_hrtimer_ops;
 	
 	err = vans->timer_ops->create(substream);
@@ -346,8 +358,8 @@ static int vans_pcm_open(struct snd_pcm_substream *substream)
 	}
 
 	runtime->hw = vans->pcm_hw;
-	runtime->hw.info &= ~SNDRV_PCM_INFO_INTERLEAVED;
-	runtime->hw.info |= SNDRV_PCM_INFO_NONINTERLEAVED;
+//	runtime->hw.info &= ~SNDRV_PCM_INFO_INTERLEAVED;
+//	runtime->hw.info |= SNDRV_PCM_INFO_NONINTERLEAVED;
 	
 	return 0;
 }
@@ -355,6 +367,9 @@ static int vans_pcm_open(struct snd_pcm_substream *substream)
 static int vans_pcm_close(struct snd_pcm_substream *substream)
 {
 	struct snd_vans *vans = snd_pcm_substream_chip(substream);
+	
+	DBG_VANS(DBG_VANS_ALSA, KERN_INFO, "entered\n");
+	
 	vans->timer_ops->free(substream);
 	return 0;
 }
@@ -392,6 +407,8 @@ static snd_pcm_uframes_t vans_pcm_pointer(struct snd_pcm_substream *substream)
 static int vans_pcm_hw_params(struct snd_pcm_substream *substream,
 			      struct snd_pcm_hw_params *hw_params)
 {
+	DBG_VANS(DBG_VANS_ALSA, KERN_INFO, "buf bytes 0x%x\n",
+		 params_buffer_bytes(hw_params))
 	return snd_pcm_lib_malloc_pages(substream,
 					params_buffer_bytes(hw_params));
 }
@@ -410,11 +427,14 @@ static snd_pcm_uframes_t vans_hrtimer_pointer(
 	struct vans_hrtimer_pcm *dpcm = runtime->private_data;
 	u64 delta;
 	u32 pos;
-	
+
 	delta = ktime_us_delta(hrtimer_cb_get_time(&dpcm->timer),
 			       dpcm->base_time);
 	delta = div_u64(delta * runtime->rate + 999999, 1000000);
 	div_u64_rem(delta, runtime->buffer_size, &pos);
+
+	DBG_VANS(DBG_VANS_TIMER, KERN_INFO, "pointer 0x%x, pos 0x%x",
+		 dpcm->hw_ptr, pos)
 	return pos;
 }
 
@@ -436,6 +456,11 @@ static int vans_hrtimer_prepare(struct snd_pcm_substream *substream)
 	nsecs = div_u64((u64)period * 1000000000UL + rate - 1, rate);
 	dpcm->period_time = ktime_set(sec, nsecs);
 
+	DBG_VANS(DBG_VANS_TIMER, KERN_INFO, "period_size %d",
+		 runtime->period_size);
+	DBG_VANS(DBG_VANS_TIMER, KERN_INFO, "runtime boundary 0x%x, "
+		 "buf size 0x%x", runtime->boundary, runtime->buffer_size);
+
 	return 0;
 }  
 
@@ -452,6 +477,7 @@ static int vans_hrtimer_create(struct snd_pcm_substream *substream)
 	dpcm->timer.function = vans_hrtimer_callback;
 	dpcm->substream = substream;
 	atomic_set(&dpcm->running, 0);
+	dpcm->hw_ptr = 0;
 	tasklet_init(&dpcm->tasklet, vans_hrtimer_pcm_elapsed,
 		     (unsigned long)dpcm);
 	return 0;
@@ -478,12 +504,30 @@ static enum hrtimer_restart vans_hrtimer_callback(struct hrtimer *timer)
 	return HRTIMER_RESTART;
 }
 
+static void vans_pcm_buf_update(struct vans_hrtimer_pcm *dpcm)
+{
+	struct snd_pcm_runtime *runtime = dpcm->substream->runtime;
+	char *a;
+
+	DBG_VANS(DBG_VANS_TIMER, KERN_INFO, "status %d, hw_prt 0x%x,"
+		 "appl_pty 0x%x", runtime->status->state,
+		 runtime->status->hw_ptr, runtime->control->appl_ptr);
+
+	dpcm->hw_ptr = runtime->control->appl_ptr;
+	DBG_VANS(DBG_VANS_TIMER, KERN_INFO, "hw_ptr 0x%x", dpcm->hw_ptr);
+
+	return;
+}
+
 static void vans_hrtimer_pcm_elapsed(unsigned long priv)
 {
 	struct vans_hrtimer_pcm *dpcm;
 	dpcm = (struct vans_hrtimer_pcm *)priv;
 
+	DBG_VANS(DBG_VANS_ALSA, KERN_INFO, "entered\n");
+
 	if (atomic_read(&dpcm->running)) {
+		vans_pcm_buf_update(dpcm);
 		snd_pcm_period_elapsed(dpcm->substream);
 	}
 	
