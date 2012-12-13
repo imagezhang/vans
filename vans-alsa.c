@@ -133,6 +133,8 @@ struct vans_hrtimer_pcm {
 	struct snd_pcm_substream *substream;
 
 	snd_pcm_uframes_t hw_ptr;
+	unsigned int buf_byte_pos;
+	unsigned int buf_byte_size;
 };
 
 static char *spk_socket_info = "224.1.1.27:3456";
@@ -456,6 +458,10 @@ static int vans_hrtimer_prepare(struct snd_pcm_substream *substream)
 	nsecs = div_u64((u64)period * 1000000000UL + rate - 1, rate);
 	dpcm->period_time = ktime_set(sec, nsecs);
 
+
+	dpcm->buf_byte_pos = 0;
+	dpcm->buf_byte_size = frames_to_bytes(runtime, runtime->buffer_size);
+
 	DBG_VANS(DBG_VANS_TIMER, KERN_INFO, "period_size %d",
 		 runtime->period_size);
 	DBG_VANS(DBG_VANS_TIMER, KERN_INFO, "runtime boundary 0x%x, "
@@ -507,13 +513,33 @@ static enum hrtimer_restart vans_hrtimer_callback(struct hrtimer *timer)
 static void vans_pcm_buf_update(struct vans_hrtimer_pcm *dpcm)
 {
 	struct snd_pcm_runtime *runtime = dpcm->substream->runtime;
-	char *a;
+	snd_pcm_uframes_t frames;
+	int len, bytes;
+	char *src;
 
 	DBG_VANS(DBG_VANS_TIMER, KERN_INFO, "status %d, hw_prt 0x%x,"
 		 "appl_pty 0x%x", runtime->status->state,
 		 runtime->status->hw_ptr, runtime->control->appl_ptr);
 
+	frames = runtime->control->appl_ptr - dpcm->hw_ptr;
 	dpcm->hw_ptr = runtime->control->appl_ptr;
+
+        bytes = frames_to_bytes(runtime, frames);
+	while (bytes > 0) {
+		
+		len = bytes;
+		if (dpcm->buf_byte_pos + bytes > dpcm->buf_byte_size) {
+			len = dpcm->buf_byte_size - dpcm->buf_byte_pos;
+		}
+
+		vans_net_sendto(runtime->dma_area + dpcm->buf_byte_pos,
+				len);
+		
+		bytes = bytes - len; 
+		dpcm->buf_byte_pos = (dpcm->buf_byte_pos + len) %
+			dpcm->buf_byte_size;
+	}
+
 	DBG_VANS(DBG_VANS_TIMER, KERN_INFO, "hw_ptr 0x%x", dpcm->hw_ptr);
 
 	return;

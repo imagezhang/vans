@@ -13,6 +13,10 @@
 #include "vans.h"
 
 //============================================================================
+#define USER_MTU 256
+
+//============================================================================
+
 struct sockaddr_in vans_out_addr;
 struct socket *vans_out_sock;
 
@@ -39,25 +43,41 @@ int vans_net_init(void)
 	return 0;
 }
 
-int vans_net_sendto(void * buff, size_t len)
+int vans_net_sendto(void * buf, size_t len)
 {
 	int r;
+	size_t tu;
 	struct kvec kvec;
 	struct msghdr msg;
 
-	kvec.iov_base = buff;
-	kvec.iov_len = len;
 
-	msg.msg_name = NULL;
-	msg.msg_control = NULL;
-	msg.msg_controllen = 0;
-	msg.msg_name = &vans_out_addr;
-	msg.msg_namelen = sizeof(vans_out_addr);
-	msg.msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL;
 
-	r = kernel_sendmsg(vans_out_sock, &msg,
-			   &kvec, 1, len);
-	DBG_VANS(DBG_VANS_NET, KERN_INFO, "sendmsg %d", r)
+	DBG_VANS(DBG_VANS_NET, KERN_INFO, "ptr 0x%x, len %d", buf, len);
+
+	while (len > 0) {
+		tu = len;
+		if (len > USER_MTU) {
+			tu = USER_MTU;
+		}
+		
+		kvec.iov_base = buf;
+		kvec.iov_len = tu;
+		
+		msg.msg_name = NULL;
+		msg.msg_control = NULL;
+		msg.msg_controllen = 0;
+		msg.msg_name = &vans_out_addr;
+		msg.msg_namelen = sizeof(vans_out_addr);
+		msg.msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL;
+
+		r = kernel_sendmsg(vans_out_sock, &msg,
+				   &kvec, 1, tu);
+
+		DBG_VANS(DBG_VANS_NET, KERN_INFO, "sendmsg %d", r);
+
+		buf = buf + tu;
+		len = len -tu;
+	}
 
 	return 0;
 }
